@@ -475,13 +475,13 @@ $sections += "<h2>SCVMM Diagnostic report</h2><div class='small'>Creation Time: 
 $sections += To-HtmlSection -Title 'VMM Server information'                        -Data $serverInfo
 $sections += To-HtmlSection -Title 'Cloud & Host Group'                            -Data (@([pscustomobject]@{ Clouds = ($clouds | ForEach-Object Name) -join ', ' ; HostGroups = ($hostGroups | ForEach-Object Name) -join ', ' }))
 $sections += To-HtmlSection -Title 'Host & VMM Agent status'                       -Data $hostRows
-$sections += To-HtmlSection -Title 'VM Inventory & vNIC–VMNetwork'                 -Data $vmRows
+$sections += To-HtmlSection -Title 'VM Inventory & vNIC-VMNetwork'                 -Data $vmRows
 $sections += To-HtmlSection -Title 'Logical Network'                               -Data $lnRows
 $sections += To-HtmlSection -Title 'VM Network'                                    -Data $vmnRows
 $sections += To-HtmlSection -Title 'IP Pool'                                       -Data $ipPoolRows
 $sections += To-HtmlSection -Title 'MAC Pool'                                      -Data $macPoolRows
 $sections += To-HtmlSection -Title 'Logical Switch'                                -Data $lswRows
-$sections += To-HtmlSection -Title 'Host NIC–Virtual Switch–Logical Network mapping' -Data $nicMapRows
+$sections += To-HtmlSection -Title 'Host NIC-Virtual Switch-Logical Network mapping' -Data $nicMapRows
 $sections += To-HtmlSection -Title ('Recent jobs (past {0} hour)' -f $JobHistoryHours) -Data $jobRows
 $sections += To-HtmlSection -Title 'Host Network Connection Test (Port/WS-Man/WMI)'    -Data $netTestRows
 
