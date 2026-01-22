@@ -88,6 +88,16 @@ caption { text-align:left; font-weight:bold; margin:6px 0; }
 footer { margin-top:20px; font-size:12px; color:#666; }
 .small { font-size: 12px; color:#666; }
 .code { font-family: Consolas, monospace; background:#fafafa; border:1px solid #eee; padding:6px; }
+/* Severity coloring for VMM Error Log */
+.sev-Critical { background: #ffe6e6; border-left: 4px solid #b30000; }
+.sev-High     { background: #fff0e6; border-left: 4px solid #b35900; }
+.sev-Medium   { background: #fff9e6; border-left: 4px solid #b38f00; }
+.sev-Low      { color: #666; }
+.badge        { display:inline-block; padding:2px 6px; font-size:12px; border-radius:3px; background:#eee; margin-right:6px; }
+.badge-critical { background:#b30000; color:#fff; }
+.badge-high     { background:#b35900; color:#fff; }
+.badge-medium   { background:#b38f00; color:#fff; }
+.badge-low      { background:#999; color:#fff; }
 </style>
 "@
 }
@@ -455,7 +465,218 @@ $jobRows = foreach ($j in $jobsRecent) {
     }
 }
 
+
+<# =======================================================================
+SCVMM report.txt Severity Classification Policy (English)
+
+Overall rule:
+- We assign a 4-level severity based on regex/keyword hits in each line.
+- If multiple patterns match, the line is promoted to the highest matched severity.
+- Priority: Critical (4) > High (3) > Medium (2) > Low (1). Empty lines get 0.
+
+Levels and examples:
+1) Critical (4): Service or platform-wide failures, fatal conditions, or HRESULTs
+   - Examples: 0x8xxxxxxx (e.g., 0x8033802A), "Fatal", "Database is unavailable",
+               "connection refused", "SSL/TLS handshake failure",
+               "VMM service ... failed/unavailable", agent authentication/certificate failures
+
+2) High (3): Operation-level failures that can block important tasks
+   - Examples: "ErrorCode=<digits>", "Exception:", "Agent not responding",
+               "Access is denied", "RPC server is unavailable", "timeout",
+               "WinRM cannot complete the operation"
+
+3) Medium (2): Performance or environmental warnings that may cause delays
+   - Examples: "Warning:", "Retrying", "throttling", "insufficient resources",
+               "rate limit"
+
+4) Low (1): Informational or minor notices
+   - Examples: "Info:", "Note:", "Succeeded with warnings", "skipped"
+
+Extensibility:
+- Add per-environment keywords (English/Korean) to the matcher.
+- Consider collapsing duplicates by HResult/ErrorCode for top-N summaries.
+======================================================================= #>
+
+
+# ---------- VMM report.txt collector + severity classifier (PS 5.1 safe) ----------
+
+# Returns numeric score: 0(None), 1(Low), 2(Medium), 3(High), 4(Critical)
+function Get-SeverityScore {
+    param([string]$Text)
+
+    # Default Low if we have any content; 0 will be used for blanks
+    $score = 1
+
+    if ($null -eq $Text -or $Text.Trim().Length -eq 0) { return 0 }
+
+    # Normalize for case-insensitive keyword search
+    $t = $Text.ToLowerInvariant()
+
+    # --- Critical (4): fatal/system-wide issues or 0x8xxxxxxx HRESULTs ---
+    # Examples: 0x8033802A, "fatal", "database is unavailable", "connection refused",
+    # "ssl/tls handshake failure", "vmm service ... failed", agent auth/cert failures
+    if ($t -match '0x8[0-9a-f]{7}\b' -or
+        $t -match '\bfatal\b' -or
+        $t -match 'database is unavailable' -or
+        $t -match 'connection refused' -or
+        $t -match 'ssl|tls.*(handshake|failure)' -or
+        $t -match 'vmm service.*(stopped|unavailable|failed)' -or
+        $t -match 'agent.*(authentication|certificate).*(fail|invalid)') {
+        return 4
+    }
+
+    # --- High (3): blocking operation failures / hard errors ---
+    # Examples: "ErrorCode=####", "Exception:", "Agent not responding",
+    # "Access is denied", "RPC server is unavailable", "timeout",
+    # "WinRM cannot complete the operation"
+    if ($t -match 'errorcode=\d+' -or
+        $t -match '\bexception\b' -or
+        $t -match 'agent not responding' -or
+        $t -match 'access is denied' -or
+        $t -match 'rpc server is unavailable' -or
+        $t -match '\btimeout\b' -or
+        $t -match 'winrm.*cannot complete the operation') {
+        # use helper to keep the max of current vs target level (3)
+        $score = :Max($score, 3)
+    }
+
+    # --- Medium (2): degradations / warnings / transient throttling ---
+    # Examples: "Warning:", "Retrying", "throttling", "insufficient resources", "rate limit"
+    if ($t -match '\bwarning\b' -or
+        $t -match 'retrying' -or
+        $t -match 'throttling' -or
+        $t -match 'insufficient resources' -or
+        $t -match 'rate limit') {
+        $score = :Max($score, 2)
+    }
+
+    # --- Low (1): informational or minor notices ---
+    # Examples: "Info:", "Note:", "Succeeded with warnings", "skipped"
+    return $score
+}
+
+# Maps numeric score to label; used for HTML/CSV output
+function Get-SeverityLabel {
+    param([int]$Score)
+    switch ($Score) {
+        4 { 'Critical' }
+        3 { 'High' }
+        2 { 'Medium' }
+        1 { 'Low' }
+        default { 'None' }
+    }
+}
+
+# Parse C:\ProgramData\VMMLogs\report.txt and extract fields/patterns
+# Returns a list of PSCustomObject with (Line, Timestamp, HResult, ErrorCode, Exception, Message, Severity, SeverityScore)
+function Parse-VmmReportTxt {
+    param(
+        [string]$Path = 'C:\ProgramData\VMMLogs\report.txt'
+    )
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    if (-not (Test-Path -Path $Path)) {
+        # File missing is a High severity incident for visibility
+        $rows.Add([pscustomobject]@{
+            Line=0; Timestamp=$null; HResult=$null; ErrorCode=$null; Exception=$null
+            Message="report.txt not found at $Path"; Severity='High'; SeverityScore=3
+        }) | Out-Null
+        return $rows
+    }
+
+    # Stream large files line-by-line
+    $ln = 0
+    Get-Content -Path $Path -ErrorAction Continue | ForEach-Object {
+        $ln += 1
+        $line = $_
+        if ($null -eq $line -or $line.Trim().Length -eq 0) { return }
+
+        # Field extraction via regex heuristics
+        $ts    = $null  # e.g., 2026-01-21 18:45:12 or 2026-01-21T18:45:12Z
+        $hr    = $null  # 0x8033802A
+        $ecode = $null  # ErrorCode=#### (decimal)
+        $ex    = $null  # Exception: <text>
+
+        if ($line -match '(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z)?)') { $ts = $matches[1] }
+        if ($line -match '(0x[0-9a-fA-F]{8})') { $hr = $matches[1] }
+        if ($line -match 'ErrorCode=(\d+)') { $ecode = $matches[1] }
+        if ($line -match '(?i)exception:? ([^;]+)') { $ex = $matches[1].Trim() }
+
+        $score = Get-SeverityScore -Text $line
+
+        $rows.Add([pscustomobject]@{
+            Line          = $ln
+            Timestamp     = $ts
+            HResult       = $hr
+            ErrorCode     = $ecode
+            Exception     = $ex
+            Message       = $line
+            Severity      = Get-SeverityLabel -Score $score
+            SeverityScore = $score
+        }) | Out-Null
+    }
+
+    return $rows
+}
+# ---------- end: VMM report.txt collector ----------
+
+# Build HTML fragment with severity styling
+function To-HtmlSection-VmmReport {
+    param($Rows)
+
+    if ($null -eq $Rows -or $Rows.Count -eq 0) {
+        return "<h2>VMM Error Log (report.txt)</h2><div class='small'>No data</div>"
+    }
+
+    # Top badges summary
+    $countCritical = ($Rows | Where-Object { $_.Severity -eq 'Critical' }).Count
+    $countHigh     = ($Rows | Where-Object { $_.Severity -eq 'High' }).Count
+    $countMedium   = ($Rows | Where-Object { $_.Severity -eq 'Medium' }).Count
+    $countLow      = ($Rows | Where-Object { $_.Severity -eq 'Low' }).Count
+
+    $summary = "<div class='small'>
+    <span class='badge badge-critical'>Critical: $countCritical</span>
+    <span class='badge badge-high'>High: $countHigh</span>
+    <span class='badge badge-medium'>Medium: $countMedium</span>
+    <span class='badge badge-low'>Low: $countLow</span>
+    </div>"
+
+    # Render table (manual to attach row classes)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<h2>VMM Error Log (report.txt)</h2>$summary<div class='tablebox'><table><thead><tr>
+        <th>#</th><th>Time</th><th>Severity</th><th>HResult</th><th>ErrorCode</th><th>Exception</th><th>Message</th>
+    </tr></thead><tbody>")
+
+    foreach ($r in $Rows) {
+        $cls = "sev-$($r.Severity)"
+        $msgEsc = [System.Web.HttpUtility]::HtmlEncode([string]$r.Message)
+        $exEsc  = [System.Web.HttpUtility]::HtmlEncode([string]$r.Exception)
+        $hrEsc  = [System.Web.HttpUtility]::HtmlEncode([string]$r.HResult)
+        $ecEsc  = [System.Web.HttpUtility]::HtmlEncode([string]$r.ErrorCode)
+        $tEsc   = [System.Web.HttpUtility]::HtmlEncode([string]$r.Timestamp)
+
+        [void]$sb.Append("<tr class='$cls'>
+            <td>$($r.Line)</td>
+            <td>$tEsc</td>
+            <td>$($r.Severity)</td>
+            <td>$hrEsc</td>
+            <td>$ecEsc</td>
+            <td>$exEsc</td>
+            <td class='code'>$msgEsc</td>
+        </tr>")
+    }
+
+    [void]$sb.Append("</tbody></table></div>")
+    return $sb.ToString()
+}
+
 # ------------------- Save CSVs -------------------
+
+# Collect VMM report.txt rows
+$reportRows = Parse-VmmReportTxt -Path 'C:\ProgramData\VMMLogs\report.txt'
+
+# Save CSV
 To-Csv $serverInfo  (Join-Path $OUT 'server_info.csv')
 To-Csv $hostRows    (Join-Path $OUT 'hosts.csv')
 To-Csv $vmRows      (Join-Path $OUT 'vms.csv')
@@ -467,6 +688,7 @@ To-Csv $lswRows     (Join-Path $OUT 'logical_switches.csv')
 To-Csv $nicMapRows  (Join-Path $OUT 'host_nic_switch_map.csv')
 To-Csv $netTestRows (Join-Path $OUT 'host_network_tests.csv')
 To-Csv $jobRows     (Join-Path $OUT 'jobs_recent.csv')
+To-Csv $reportRows (Join-Path $OUT 'report_log.csv')
 
 # ------------------- HTML report -------------------
 $sections = @()
@@ -484,6 +706,7 @@ $sections += To-HtmlSection -Title 'Logical Switch'                             
 $sections += To-HtmlSection -Title 'Host NIC-Virtual Switch-Logical Network mapping' -Data $nicMapRows
 $sections += To-HtmlSection -Title ('Recent jobs (past {0} hour)' -f $JobHistoryHours) -Data $jobRows
 $sections += To-HtmlSection -Title 'Host Network Connection Test (Port/WS-Man/WMI)'    -Data $netTestRows
+$sections += To-HtmlSection-VmmReport -Rows $reportRows
 
 $html = ConvertTo-Html -Head (Html-Style) -Body ($sections -join "`n")
 $null = $html | Set-Content -Path $HTMLpath -Encoding UTF8
