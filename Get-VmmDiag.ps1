@@ -1,7 +1,32 @@
+#Requires -Version 5.1
+#Requires -Modules VirtualMachineManager
+#Requires -RunAsAdministrator
 
-<# SCVMM preflight collection + Network connectivity/ports/WinRM/WS-Man/WMI test report
+<# 
+.SYNOPSIS
+This script will generate a html-based test report on SCVMM preflight collection and the etwork connectivity/ports/WinRM/WS-Man/WMI
+
+.DESCRIPTION
+This script collects various SCVMM server, host, VM, network, and job information, and performs network connectivity tests to the managed hosts, including TCP port tests, WinRM configuration retrieval, WS-Man connectivity, VMM agent version check, and WMI connectivity tests.
+The output is saved as an HTML report along with CSV files for each data section.
 - Required ports: 5985/5986 (WinRM), 443 (HTTPS/BITS), 445 (SMB), 135 (RPC), [optional] 139 (NetBIOS)
 - WS-Man agent version check: root/scvmm/AgentManagement (Invoke-WSManAction)
+
+.PARAMETER RefreshLLDP
+If specified, the script will attempt to refresh LLDP information on each host network adapter.
+.PARAMETER JobHistoryHours
+Specifies the time window (in hours) for collecting recent job history. Default is 24 hours.
+.PARAMETER IncludeLegacyNetBIOS
+If specified, the script will include tests for legacy NetBIOS port 139/tcp.    
+.PARAMETER Credential
+Specifies the credentials to use for remote host tests. If not provided, the script will prompt for credentials.
+
+.OUTPUTS
+HTML report file, CSV files and WinRM configugration files per host in a timestamped output folder under C:\VMMReports\SCVMM_Diag_.
+
+.LINK
+https://github.com/johamms/SCVMM-log-collection
+
 #>
 
 [CmdletBinding()]
@@ -9,19 +34,10 @@ param(
     [switch]$RefreshLLDP,
     [int]$JobHistoryHours = 24,
     [switch]$IncludeLegacyNetBIOS,          # include 139/tcp test
-    [Parameter(Mandatory=$false)]
     [System.Management.Automation.PSCredential]$Credential
 )
 
-# ------------------- Common utilities -------------------
-
 # --- Version & cmdlet capability helpers (PowerShell 5.1-safe) ---
-
-function Supports-Cmdlet {
-    param([Parameter(Mandatory)][string]$Name)
-    $cmd = Get-Command -Name $Name -Module VirtualMachineManager -ErrorAction SilentlyContinue
-    return ($null -ne $cmd)
-}
 
 function Get-VmmVersionInfo {
     param([Parameter(Mandatory)]$VmmServer)
@@ -29,10 +45,12 @@ function Get-VmmVersionInfo {
     $build = $VmmServer.ProductVersion
     $major = 'Unknown'; $label = 'Unknown'
 
-    if ($ver -match '^10\.25') { $major = '2025'; $label = 'SCVMM 2025' }
-    elseif ($ver -match '^10\.22') { $major = '2022'; $label = 'SCVMM 2022' }
-    elseif ($ver -match '^10\.19') { $major = '2019'; $label = 'SCVMM 2019' }
-    elseif ($ver -match '^(4\.0|3\.2)') { $major = '2016'; $label = 'SCVMM 2016/2012R2' }
+    switch -Regex ($ver) {
+        '^10\.25' { $major = '2025'; $label = 'SCVMM 2025' }
+        '^10\.22' { $major = '2022'; $label = 'SCVMM 2022' }
+        '^10\.19' { $major = '2019'; $label = 'SCVMM 2019' }
+        '^(4\.0|3\.2)' { $major = '2016'; $label = 'SCVMM 2016/2012R2' }
+    }
 
     [pscustomobject]@{
         RawVersion = $ver
@@ -43,36 +61,35 @@ function Get-VmmVersionInfo {
 }
 
 function Get-VmmIpPools {
-    param(
-        $Vmm,
-        [switch]$PreferStatic
-    )
+    param($Vmm, [switch]$PreferStatic)
 
-    # Prefer using Get-SCStaticIPAddressPool when available (SCVMM 2016+)
-    if (Supports-Cmdlet 'Get-SCStaticIPAddressPool') {
+    # Prefer Get-SCStaticIPAddressPool (SCVMM 2016+), fallback to Get-SCIPPool
+    if (Get-Command 'Get-SCStaticIPAddressPool' -Module VirtualMachineManager -ErrorAction SilentlyContinue) {
         return Get-SCStaticIPAddressPool -VMMServer $Vmm -ErrorAction SilentlyContinue
     }
-    # Fallback: older environments that still expose Get-SCIPPool
-    elseif (Supports-Cmdlet 'Get-SCIPPool' -and (-not $PreferStatic)) {
+    elseif (-not $PreferStatic -and (Get-Command 'Get-SCIPPool' -Module VirtualMachineManager -ErrorAction SilentlyContinue)) {
         return Get-SCIPPool -VMMServer $Vmm -ErrorAction SilentlyContinue
     }
     else {
-        Write-Warning "No IP pool cmdlet available in this environment. Skipping IP pool collection."
+        Write-Warning "No IP pool cmdlet available. Skipping IP pool collection."
         return @()
     }
 }
 
 function New-OutputFolder {
     $root = 'C:\VMMReports'
-    if (-not (Test-Path $root)) { New-Item -Path $root -ItemType Directory -Force | Out-Null }
-    $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
-    $out = Join-Path $root ("SCVMM_Diag_{0}" -f $stamp)
-    New-Item -Path $out -ItemType Directory -Force | Out-Null
+    $null = New-Item -Path $root -ItemType Directory -Force -ErrorAction SilentlyContinue
+    $out = Join-Path $root ("SCVMM_Diag_{0:yyyyMMdd_HHmmss}" -f (Get-Date))
+    $null = New-Item -Path $out -ItemType Directory -Force
     return $out
 }
 
-function Get-Prop { param($Object, [string]$Name) try { $Object | Select-Object -ExpandProperty $Name -ErrorAction Stop } catch { $null } }
-function To-Csv   { param($Data, [string]$Path) if ($null -ne $Data -and $Data.Count -gt 0) { $Data | Export-Csv -Path $Path -Encoding UTF8 -NoTypeInformation } }
+function Export-ToCsv {
+    param([Parameter(ValueFromPipeline)]$Data, [string]$Path)
+    begin { $items = @() }
+    process { if ($Data) { $items += $Data } }
+    end { if ($items.Count) { $items | Export-Csv -Path $Path -Encoding UTF8 -NoTypeInformation } }
+}
 
 function Html-Style {
 @"
@@ -98,12 +115,10 @@ function To-HtmlSection { param([string]$Title, $Data)
 }
 
 # ------------------- Output/Module preparation -------------------
-$ErrorActionPreference = 'Stop'
 $OUT  = New-OutputFolder
 $HTMLpath = Join-Path $OUT 'SCVMM_Diag_Report.html'
 Write-Host "[INFO] Output directory: $OUT"
 
-Import-Module VirtualMachineManager -ErrorAction Stop
 $vmm = Get-SCVMMServer -ComputerName $env:COMPUTERNAME
 if (-not $vmm) { throw "Get-SCVMMServer failed. Make sure you're running in the VMM PowerShell console." }
 
@@ -113,24 +128,21 @@ if (-not $Credential) {
 }
 
 # ------------------- Overview section -------------------
-$serverInfo = @()
-$serverRow = [ordered]@{
-    VMMServer      = if ($null -ne (Get-Prop $vmm 'Name')) { (Get-Prop $vmm 'Name') } else { $env:COMPUTERNAME }
-    FQDN           = (Get-Prop $vmm 'FullyQualifiedDomainName')
-    Version        = if ($null -ne (Get-Prop $vmm 'Version')) { (Get-Prop $vmm 'Version') } else { (Get-Prop $vmm 'ServerVersion') }
-    Build          = (Get-Prop $vmm 'BuildNumber')
-    DBServer       = (Get-Prop $vmm 'DatabaseServerName')
-    DBName         = (Get-Prop $vmm 'DatabaseName')
-    ServiceAccount = (Get-Prop $vmm 'ServiceAccountName')
-    TimeCollected  = (Get-Date)
-}
-# After $serverRow …
 $versionInfo = Get-VmmVersionInfo -VmmServer $vmm
-$serverRow['VMMVersionRaw'] = $versionInfo.RawVersion
-$serverRow['VMMBuild']      = $versionInfo.Build
-$serverRow['VMMVersionMajor'] = $versionInfo.Major
-$serverRow['VMMVersionLabel'] = $versionInfo.Label
-$serverInfo += [pscustomobject]$serverRow
+$serverInfo = @([pscustomobject][ordered]@{
+    VMMServer       = if ($vmm.Name) { $vmm.Name } else { $env:COMPUTERNAME }
+    FQDN            = $vmm.FullyQualifiedDomainName
+    Version         = if ($vmm.Version) { $vmm.Version } else { $vmm.ServerVersion }
+    Build           = $vmm.BuildNumber
+    DBServer        = $vmm.DatabaseServerName
+    DBName          = $vmm.DatabaseName
+    ServiceAccount  = $vmm.ServiceAccountName
+    TimeCollected   = Get-Date
+    VMMVersionRaw   = $versionInfo.RawVersion
+    VMMBuild        = $versionInfo.Build
+    VMMVersionMajor = $versionInfo.Major
+    VMMVersionLabel = $versionInfo.Label
+})
 
 
 
@@ -142,66 +154,41 @@ $jobsRecent = Get-SCJob -VMMServer $vmm -ErrorAction SilentlyContinue | Where-Ob
 # ------------------- Hosts/Agent -------------------
 $hosts = Get-SCVMHost -VMMServer $vmm
 $hostRows = foreach ($h in $hosts) {
-    $mc = Get-Prop $h 'ManagedComputer'
-    $clusterObj = Get-Prop $h 'HostCluster'
-    $clusterName = if ($clusterObj) { $clusterObj.Name } else { $null }
-    $groupObj    = Get-Prop $h 'VMHostGroup'
-    $groupName   = if ($groupObj) { $groupObj.Name } else { $null }
-    $statusVal   = if ($null -ne (Get-Prop $h 'Status')) { (Get-Prop $h 'Status') } else { (Get-Prop $h 'ServerState') }
-
+    $mc = $h.ManagedComputer
     [pscustomobject][ordered]@{
         Host             = $h.Name
-        FQDN             = (Get-Prop $h 'FullyQualifiedDomainName')
-        Cluster          = $clusterName
-        Group            = $groupName
-        OS               = (Get-Prop $h 'OperatingSystem')
-        Status           = $statusVal
-        Health           = (Get-Prop $h 'HealthStatus')
-        LogicalCPU       = (Get-Prop $h 'LogicalProcessorCount')
-        MemoryGB         = if ($mem = Get-Prop $h 'PhysicalMemory') { [Math]::Round(($mem/1GB),1) } else { $null }
-        AgentVersion     = (Get-Prop $mc 'AgentVersion')
-        AgentCommState   = (Get-Prop $mc 'CommunicationState')
-        AgentResponding  = (Get-Prop $mc 'IsResponding')
-        AgentLastContact = (Get-Prop $mc 'LastContact')
-        LastRefresh      = (Get-Prop $h 'LastRefreshTime')
+        FQDN             = $h.FullyQualifiedDomainName
+        Cluster          = $h.HostCluster.Name
+        Group            = $h.VMHostGroup.Name
+        OS               = $h.OperatingSystem
+        Status           = if ($h.Status) { $h.Status } else { $h.ServerState }
+        Health           = $h.HealthStatus
+        LogicalCPU       = $h.LogicalProcessorCount
+        MemoryGB         = if ($h.PhysicalMemory) { [Math]::Round($h.PhysicalMemory / 1GB, 1) } else { $null }
+        AgentVersion     = $mc.AgentVersion
+        AgentCommState   = $mc.CommunicationState
+        AgentResponding  = $mc.IsResponding
+        AgentLastContact = $mc.LastContact
+        LastRefresh      = $h.LastRefreshTime
     }
 }
 
 # ------------------- VM inventory -------------------
 $vms = Get-SCVirtualMachine -VMMServer $vmm
 $vmRows = foreach ($vm in $vms) {
-    $vmHostObj  = Get-Prop $vm 'VMHost'
-    $cloudObj   = Get-Prop $vm 'Cloud'
-    $vmHostName = if ($vmHostObj) { $vmHostObj.Name } else { $null }
-    $cloudName  = if ($cloudObj) { $cloudObj.Name } else { $null }
-
     $vnics = Get-SCVirtualNetworkAdapter -VM $vm -ErrorAction SilentlyContinue
-
-    # >>> FIXED (PowerShell 5.1-safe): build pairs WITHOUT inline 'if' in the -f arguments <<<
-    $nicSummary = $null
-    if ($vnics -and $vnics.Count -gt 0) {
-        $pairs = @()
-        foreach ($vnic in $vnics) {
-            $vmNetName = $null
-            # Be defensive: some objects may not have VMNetwork; check existence and value
-            if ($vnic -and ($vnic.PSObject.Properties.Match('VMNetwork').Count -gt 0) -and $vnic.VMNetwork) {
-                $vmNetName = $vnic.VMNetwork.Name
-            }
-            $pairs += ("{0} -> {1}" -f $vnic.Name, $vmNetName)
-        }
-        $nicSummary = ($pairs -join "; ")
-    }
+    $nicSummary = ($vnics | ForEach-Object { "{0} -> {1}" -f $_.Name, $_.VMNetwork.Name }) -join '; '
 
     [pscustomobject][ordered]@{
         VM              = $vm.Name
-        Status          = (Get-Prop $vm 'Status')
-        Host            = $vmHostName
-        Cloud           = $cloudName
-        CPUCount        = (Get-Prop $vm 'CPUCount')
-        MemoryMB        = (Get-Prop $vm 'MemoryMB')
-        OperatingSystem = (Get-Prop $vm 'OperatingSystem')
+        Status          = $vm.Status
+        Host            = $vm.VMHost.Name
+        Cloud           = $vm.Cloud.Name
+        CPUCount        = $vm.CPUCount
+        MemoryMB        = $vm.MemoryMB
+        OperatingSystem = $vm.OperatingSystem
         VMNetworks      = $nicSummary
-        LastRefresh     = (Get-Prop $vm 'LastRefreshTime')
+        LastRefresh     = $vm.LastRefreshTime
     }
 }
 
@@ -216,30 +203,29 @@ $logicalSwitches = Get-SCLogicalSwitch  -VMMServer $vmm -ErrorAction SilentlyCon
 $lnRows = $logicalNetworks | ForEach-Object {
     [pscustomobject]@{
         LogicalNetwork = $_.Name
-        IsolationType  = (Get-Prop $_ 'NetworkIsolation')
-        Sites          = ($_.NetworkSites | ForEach-Object Name) -join ', '
+        IsolationType  = $_.NetworkIsolation
+        Sites          = ($_.NetworkSites.Name) -join ', '
     }
 }
+
 $vmnRows = $vmNetworks | ForEach-Object {
-    $lnObj = Get-Prop $_ 'LogicalNetwork'
     [pscustomobject]@{
         VMNetwork  = $_.Name
-        LogicalNet = if ($lnObj) { $lnObj.Name } else { $null }
-        Subnets    = ($_.Subnets | ForEach-Object Name) -join ', '
-        Isolation  = (Get-Prop $_ 'NetworkIsolation')
+        LogicalNet = $_.LogicalNetwork.Name
+        Subnets    = ($_.Subnets.Name) -join ', '
+        Isolation  = $_.NetworkIsolation
     }
 }
 
 $ipPoolRows = $ipPools | ForEach-Object {
-    # Output only properties common to both cmdlets (Static IP Pool standard; some environments may not have dynamic pool objects)
     [pscustomobject]@{
         IPPool     = $_.Name
-        LogicalNet = if ($null -ne (Get-Prop $_ 'LogicalNetwork')) { (Get-Prop $_ 'LogicalNetwork').Name } else { $null }
+        LogicalNet = $_.LogicalNetwork.Name
         StartIP    = $_.StartIPAddress
         EndIP      = $_.EndIPAddress
         Subnet     = $_.Subnet
         Gateway    = $_.DefaultGateway
-        DNS        = ($_.DnsServers) -join ', '
+        DNS        = $_.DnsServers -join ', '
         InUse      = $_.AddressesInUse
         Available  = $_.AddressesAvailable
     }
@@ -255,46 +241,37 @@ $macPoolRows = $macPools | ForEach-Object {
         Available = $_.AvailableMacAddresses
     }
 }
+
 $lswRows = $logicalSwitches | ForEach-Object {
     [pscustomobject]@{
-        LogicalSwitch   = $_.Name
-        UplinkProfile   = ($_.UplinkPortProfiles | ForEach-Object Name) -join ', '
-        PortClass       = ($_.PortClassifications | ForEach-Object Name) -join ', '
-        CompliantHosts  = ($_.CompliantVMHosts | ForEach-Object Name) -join ', '
+        LogicalSwitch  = $_.Name
+        UplinkProfile  = $_.UplinkPortProfiles.Name -join ', '
+        PortClass      = $_.PortClassifications.Name -join ', '
+        CompliantHosts = $_.CompliantVMHosts.Name -join ', '
     }
 }
 
 # ------------------- Host NIC–vSwitch–Logical Network mapping -------------------
-$nicMapRows = New-Object System.Collections.Generic.List[object]
-foreach ($h in $hosts) {
+$nicMapRows = foreach ($h in $hosts) {
     $nics = Get-SCVMHostNetworkAdapter -VMHost $h -ErrorAction SilentlyContinue
     foreach ($nic in $nics) {
-        $vsObj = Get-Prop $nic 'VirtualSwitch'
-        $lsObj = Get-Prop $nic 'LogicalSwitch'
-        $lns   = $nic.LogicalNetworks
-
-        $vsName = if ($vsObj) { $vsObj.Name } else { $null }
-        $lsName = if ($lsObj) { $lsObj.Name } else { $null }
-        $connName = if ($null -ne $nic.ConnectionName) { $nic.ConnectionName } else { $nic.Name }
-        $boundLn  = if ($lns) { ($lns | ForEach-Object Name) -join ', ' } else { $null }
-
-        $nicMapRows.Add([pscustomobject][ordered]@{
+        [pscustomobject][ordered]@{
             Host            = $h.Name
-            AdapterName     = $connName
-            VSwitch         = $vsName
-            LogicalSwitch   = $lsName
-            BoundLogicalNet = $boundLn
-            VLanMode        = (Get-Prop $nic 'VlanMode')
-            VLanID          = (Get-Prop $nic 'VlanID')
-            IsTeamed        = (Get-Prop $nic 'IsTeamed')
-            MACAddress      = (Get-Prop $nic 'MacAddress')
-            LinkSpeed       = (Get-Prop $nic 'LinkSpeed')
-            LastRefresh     = (Get-Prop $nic 'LastRefreshTime')
-        }) | Out-Null
+            AdapterName     = if ($nic.ConnectionName) { $nic.ConnectionName } else { $nic.Name }
+            VSwitch         = $nic.VirtualSwitch.Name
+            LogicalSwitch   = $nic.LogicalSwitch.Name
+            BoundLogicalNet = $nic.LogicalNetworks.Name -join ', '
+            VLanMode        = $nic.VlanMode
+            VLanID          = $nic.VlanID
+            IsTeamed        = $nic.IsTeamed
+            MACAddress      = $nic.MacAddress
+            LinkSpeed       = $nic.LinkSpeed
+            LastRefresh     = $nic.LastRefreshTime
+        }
 
         if ($RefreshLLDP) {
-            try { Set-SCVMHostNetworkAdapter -VMHostNetworkAdapter $nic -RefreshLLDP -ErrorAction Stop | Out-Null }
-            catch { Write-Warning ("Failed to refresh LLDP: {0}" -f $_.Exception.Message) }
+            try { $null = Set-SCVMHostNetworkAdapter -VMHostNetworkAdapter $nic -RefreshLLDP -ErrorAction Stop }
+            catch { Write-Warning "Failed to refresh LLDP: $($_.Exception.Message)" }
         }
     }
 }
@@ -352,14 +329,14 @@ function Test-WsmanAndAgent {
     try {
         $null = Test-WSMan -ComputerName $ComputerName -Authentication Default -ErrorAction Stop
         $wsmanOk = $true
-        # Query agent version from VMM AgentManagement (via WS-Man)
-        try {
-            $resp = Invoke-WSManAction -Action GetVersion -ComputerName $ComputerName `
-                    -ResourceURI "http://schemas.microsoft.com/wbem/wsman/1/wmi/root/scvmm/AgentManagement" `
-                    -Authentication Default -Credential $Credential -ErrorAction Stop
-            $agentVersion = ($resp | Out-String).Trim()
-        } catch { $wsmanErr = "AgentVersion error: $($_.Exception.Message)" }
     } catch { $wsmanErr = $_.Exception.Message }
+    # Query agent version from VMM AgentManagement (via WS-Man)
+    try {
+        $resp = Invoke-WSManAction -Action GetVersion -ComputerName $ComputerName `
+                -ResourceURI "http://schemas.microsoft.com/wbem/wsman/1/wmi/root/scvmm/AgentManagement" `
+                -Authentication Default -Credential $Credential -ErrorAction Stop
+        $agentVersion = $resp.Version
+    } catch { $wsmanErr = "AgentVersion error: $($_.Exception.Message)" }
     [pscustomobject]@{ WSManOk=$wsmanOk; AgentVersion=$agentVersion; WSManError=$wsmanErr }
 }
 
@@ -367,7 +344,10 @@ function Test-WMI {
     param([string]$ComputerName,[System.Management.Automation.PSCredential]$Credential)
     # Try both CIM (WS-Man) and DCOM paths
     $wsCimOk=$false; $dcCimOk=$false; $err1=$null; $err2=$null
-    try { $null = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -Credential $Credential -ErrorAction Stop; $wsCimOk=$true } catch { $err1 = $_.Exception.Message }
+    try { 
+        $null = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $ComputerName -Credential $Credential -ErrorAction Stop
+        $wsCimOk=$true 
+    } catch { $err1 = $_.Exception.Message }
     try { 
         $opt = New-CimSessionOption -Protocol Dcom
         $sess = New-CimSession -ComputerName $ComputerName -Credential $Credential -SessionOption $opt -ErrorAction Stop
@@ -379,57 +359,44 @@ function Test-WMI {
 }
 
 # Host-wise network tests
-$netTestRows = New-Object System.Collections.Generic.List[object]
-foreach ($h in $hosts) {
-    $cn = $h.Name
-    $fqdn = (Get-Prop $h 'FullyQualifiedDomainName')
-    $target = if ($fqdn) { $fqdn } else { $cn }
+$netTestRows = foreach ($h in $hosts) {
+    $target = if ($h.FullyQualifiedDomainName) { $h.FullyQualifiedDomainName } else { $h.Name }
 
     # DNS/IP/Ping
-    $dnsOk=$null; $resolvedIPs=$null; $pingMs=$null
+    $dnsOk = $false; $resolvedIPs = $null; $pingMs = $null
     try {
         $r = Resolve-DnsName -Name $target -ErrorAction Stop
         $dnsOk = $true
-        $resolvedIPs = ($r | Where-Object { $_.Type -eq 'A' } | ForEach-Object IPAddress) -join ', '
-    } catch { $dnsOk = $false }
+        $resolvedIPs = ($r | Where-Object Type -eq 'A').IPAddress -join ', '
+    } catch { }
     try {
-        $p = Test-Connection -ComputerName $target -Count 2 -ErrorAction Stop
-        $avg = ($p | Measure-Object -Property ResponseTime -Average).Average
-        $pingMs = if ($avg) { [Math]::Round($avg,1) } else { $null }
-    } catch { $pingMs = $null }
+        $pingMs = [Math]::Round((Test-Connection -ComputerName $target -Count 2 -ErrorAction Stop |
+            Measure-Object -Property ResponseTime -Average).Average, 1)
+    } catch { }
 
-    # TCP ports
-    $portResults = foreach ($port in $BASE_PORTS) { Test-TcpPort -ComputerName $target -Port $port }
-    $p443  = $portResults | Where-Object { $_.Port -eq 443 }
-    $p445  = $portResults | Where-Object { $_.Port -eq 445 }
-    $p5985 = $portResults | Where-Object { $_.Port -eq 5985 }
-    $p5986 = $portResults | Where-Object { $_.Port -eq 5986 }
-    $p135  = $portResults | Where-Object { $_.Port -eq 135 }
-    $p139  = $portResults | Where-Object { $_.Port -eq 139 }
+    # TCP ports - build hashtable for easy lookup
+    $portResults = @{}
+    foreach ($port in $BASE_PORTS) {
+        $portResults[$port] = (Test-TcpPort -ComputerName $target -Port $port).TcpTestSucceeded
+    }
 
-    $p139Ok = if ($p139) { $p139.TcpTestSucceeded } else { $null }
-
-    # WS-Man & Agent
+    # WS-Man, WMI & WinRM details
     $ws = Test-WsmanAndAgent -ComputerName $target -Credential $Credential
-
-    # WMI (DCOM/WS-Man)
     $wmi = Test-WMI -ComputerName $target -Credential $Credential
-
-    # Remote WinRM config snapshot (file)
     $winrmFile = Get-RemoteWinRMDetails -ComputerName $target -Credential $Credential -OutDir $OUT
 
-    $netTestRows.Add([pscustomobject][ordered]@{
-        Host              = $cn
+    [pscustomobject][ordered]@{
+        Host              = $h.Name
         TargetName        = $target
         DNS_OK            = $dnsOk
         DNS_ResolvedIPs   = $resolvedIPs
         Ping_AvgMs        = $pingMs
-        TCP_443_OK        = $p443.TcpTestSucceeded
-        TCP_445_OK        = $p445.TcpTestSucceeded
-        TCP_5985_OK       = $p5985.TcpTestSucceeded
-        TCP_5986_OK       = $p5986.TcpTestSucceeded
-        TCP_135_OK        = $p135.TcpTestSucceeded
-        TCP_139_OK        = $p139Ok
+        TCP_443_OK        = $portResults[443]
+        TCP_445_OK        = $portResults[445]
+        TCP_5985_OK       = $portResults[5985]
+        TCP_5986_OK       = $portResults[5986]
+        TCP_135_OK        = $portResults[135]
+        TCP_139_OK        = $portResults[139]
         WSMan_OK          = $ws.WSManOk
         VMM_AgentVersion  = $ws.AgentVersion
         WSMan_Error       = $ws.WSManError
@@ -438,7 +405,7 @@ foreach ($h in $hosts) {
         WMI_WSMan_Error   = $wmi.WMI_WSMan_Error
         WMI_DCOM_Error    = $wmi.WMI_DCOM_Error
         WinRM_DetailsFile = $winrmFile
-    }) | Out-Null
+    }
 }
 
 # ------------------- Recent jobs -------------------
@@ -456,17 +423,20 @@ $jobRows = foreach ($j in $jobsRecent) {
 }
 
 # ------------------- Save CSVs -------------------
-To-Csv $serverInfo  (Join-Path $OUT 'server_info.csv')
-To-Csv $hostRows    (Join-Path $OUT 'hosts.csv')
-To-Csv $vmRows      (Join-Path $OUT 'vms.csv')
-To-Csv $lnRows      (Join-Path $OUT 'logical_networks.csv')
-To-Csv $vmnRows     (Join-Path $OUT 'vm_networks.csv')
-To-Csv $ipPoolRows  (Join-Path $OUT 'ip_pools.csv')
-To-Csv $macPoolRows (Join-Path $OUT 'mac_pools.csv')
-To-Csv $lswRows     (Join-Path $OUT 'logical_switches.csv')
-To-Csv $nicMapRows  (Join-Path $OUT 'host_nic_switch_map.csv')
-To-Csv $netTestRows (Join-Path $OUT 'host_network_tests.csv')
-To-Csv $jobRows     (Join-Path $OUT 'jobs_recent.csv')
+$csvExports = @{
+    'server_info.csv'         = $serverInfo
+    'hosts.csv'               = $hostRows
+    'vms.csv'                 = $vmRows
+    'logical_networks.csv'    = $lnRows
+    'vm_networks.csv'         = $vmnRows
+    'ip_pools.csv'            = $ipPoolRows
+    'mac_pools.csv'           = $macPoolRows
+    'logical_switches.csv'    = $lswRows
+    'host_nic_switch_map.csv' = $nicMapRows
+    'host_network_tests.csv'  = $netTestRows
+    'jobs_recent.csv'         = $jobRows
+}
+$csvExports.GetEnumerator() | ForEach-Object { $_.Value | Export-ToCsv -Path (Join-Path $OUT $_.Key) }
 
 # ------------------- HTML report -------------------
 $sections = @()
