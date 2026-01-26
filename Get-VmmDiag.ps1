@@ -24,6 +24,15 @@ Specifies the credentials to use for remote host tests. If not provided, the scr
 .OUTPUTS
 HTML report file, CSV files and WinRM configugration files per host in a timestamped output folder under C:\VMMReports\SCVMM_Diag_.
 
+.EXAMPLE
+PS> .\Get-VmmDiag.ps1
+
+.EXAMPLE
+PS> .\Get-VmmDiag.ps1 -RefreshLLDP -JobHistoryHours 24 -Credential (Get-Credential)
+
+.EXAMPLE
+PS> .\Get-VmmDiag.ps1 -RefreshLLDP -JobHistoryHours 24 -IncludeLegacyNetBIOS -Credential "Contoso\administrator"
+
 .LINK
 https://github.com/johamms/SCVMM-log-collection
 
