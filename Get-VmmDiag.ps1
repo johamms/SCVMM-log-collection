@@ -1,7 +1,41 @@
+#Requires -Version 5.1
+#Requires -Modules VirtualMachineManager
+#Requires -RunAsAdministrator
 
-<# SCVMM preflight collection + Network connectivity/ports/WinRM/WS-Man/WMI test report
+<# 
+.SYNOPSIS
+This script will generate a html-based test report on SCVMM preflight collection and the etwork connectivity/ports/WinRM/WS-Man/WMI
+
+.DESCRIPTION
+This script collects various SCVMM server, host, VM, network, and job information, and performs network connectivity tests to the managed hosts, including TCP port tests, WinRM configuration retrieval, WS-Man connectivity, VMM agent version check, and WMI connectivity tests.
+The output is saved as an HTML report along with CSV files for each data section.
 - Required ports: 5985/5986 (WinRM), 443 (HTTPS/BITS), 445 (SMB), 135 (RPC), [optional] 139 (NetBIOS)
 - WS-Man agent version check: root/scvmm/AgentManagement (Invoke-WSManAction)
+
+.PARAMETER RefreshLLDP
+If specified, the script will attempt to refresh LLDP information on each host network adapter.
+.PARAMETER JobHistoryHours
+Specifies the time window (in hours) for collecting recent job history. Default is 24 hours.
+.PARAMETER IncludeLegacyNetBIOS
+If specified, the script will include tests for legacy NetBIOS port 139/tcp.    
+.PARAMETER Credential
+Specifies the credentials to use for remote host tests. If not provided, the script will prompt for credentials.
+
+.OUTPUTS
+HTML report file, CSV files and WinRM configugration files per host in a timestamped output folder under C:\VMMReports\SCVMM_Diag_.
+
+.EXAMPLE
+PS> .\Get-VmmDiag.ps1
+
+.EXAMPLE
+PS> .\Get-VmmDiag.ps1 -RefreshLLDP -JobHistoryHours 24 -Credential (Get-Credential)
+
+.EXAMPLE
+PS> .\Get-VmmDiag.ps1 -RefreshLLDP -JobHistoryHours 24 -IncludeLegacyNetBIOS -Credential "Contoso\administrator"
+
+.LINK
+https://github.com/johamms/SCVMM-log-collection
+
 #>
 
 [CmdletBinding()]
@@ -113,7 +147,6 @@ $OUT  = New-OutputFolder
 $HTMLpath = Join-Path $OUT 'SCVMM_Diag_Report.html'
 Write-Host "[INFO] Output directory: $OUT"
 
-Import-Module VirtualMachineManager -ErrorAction Stop
 $vmm = Get-SCVMMServer -ComputerName $env:COMPUTERNAME
 if (-not $vmm) { throw "Get-SCVMMServer failed. Make sure you're running in the VMM PowerShell console." }
 
@@ -367,7 +400,7 @@ function Test-WsmanAndAgent {
             $resp = Invoke-WSManAction -Action GetVersion -ComputerName $ComputerName `
                     -ResourceURI "http://schemas.microsoft.com/wbem/wsman/1/wmi/root/scvmm/AgentManagement" `
                     -Authentication Default -Credential $Credential -ErrorAction Stop
-            $agentVersion = ($resp | Out-String).Trim()
+            $agentVersion = ($resp.Version).Trim()
         } catch { $wsmanErr = "AgentVersion error: $($_.Exception.Message)" }
     } catch { $wsmanErr = $_.Exception.Message }
     [pscustomobject]@{ WSManOk=$wsmanOk; AgentVersion=$agentVersion; WSManError=$wsmanErr }
