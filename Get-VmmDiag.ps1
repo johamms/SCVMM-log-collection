@@ -570,7 +570,7 @@ function Get-SeverityScore {
         $t -match '\btimeout\b' -or
         $t -match 'winrm.*cannot complete the operation') {
         # use helper to keep the max of current vs target level (3)
-        $score = :Max($score, 3)
+        $score = [Math]::Max($score, 3)
     }
 
     # --- Medium (2): degradations / warnings / transient throttling ---
@@ -580,7 +580,7 @@ function Get-SeverityScore {
         $t -match 'throttling' -or
         $t -match 'insufficient resources' -or
         $t -match 'rate limit') {
-        $score = :Max($score, 2)
+        $score = [Math]::Max($score, 2)
     }
 
     # --- Low (1): informational or minor notices ---
@@ -603,55 +603,84 @@ function Get-SeverityLabel {
 # Parse C:\ProgramData\VMMLogs\report.txt and extract fields/patterns
 # Returns a list of PSCustomObject with (Line, Timestamp, HResult, ErrorCode, Exception, Message, Severity, SeverityScore)
 function Parse-VmmReportTxt {
+    [CmdletBinding()]
     param(
-        [string]$Path = 'C:\ProgramData\VMMLogs\report.txt'
+        [Parameter(Mandatory = $true)]
+        [string[]]$Path
     )
 
     $rows = New-Object System.Collections.Generic.List[object]
 
-    if (-not (Test-Path -Path $Path)) {
-        # File missing is a High severity incident for visibility
-        $rows.Add([pscustomobject]@{
-            Line=0; Timestamp=$null; HResult=$null; ErrorCode=$null; Exception=$null
-            Message="report.txt not found at $Path"; Severity='High'; SeverityScore=3
-        }) | Out-Null
-        return $rows
-    }
+    foreach ($file in $Path) {
 
-    # Stream large files line-by-line
-    $ln = 0
-    Get-Content -Path $Path -ErrorAction Continue | ForEach-Object {
-        $ln += 1
-        $line = $_
-        if ($null -eq $line -or $line.Trim().Length -eq 0) { return }
+        if (-not (Test-Path -LiteralPath $file)) {
+            continue
+        }
 
-        # Field extraction via regex heuristics
-        $ts    = $null  # e.g., 2026-01-21 18:45:12 or 2026-01-21T18:45:12Z
-        $hr    = $null  # 0x8033802A
-        $ecode = $null  # ErrorCode=#### (decimal)
-        $ex    = $null  # Exception: <text>
+        # --- Determine report-level timestamp ---
+        $reportTime = $null
 
-        if ($line -match '(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z)?)') { $ts = $matches[1] }
-        if ($line -match '(0x[0-9a-fA-F]{8})') { $hr = $matches[1] }
-        if ($line -match 'ErrorCode=(\d+)') { $ecode = $matches[1] }
-        if ($line -match '(?i)exception:? ([^;]+)') { $ex = $matches[1].Trim() }
+        # Try to extract "Error report created <date time>" from header
+        $headerLines = Get-Content -LiteralPath $file -TotalCount 20 -ErrorAction SilentlyContinue
+        foreach ($h in $headerLines) {
+            if ($h -match 'Error report created\s+(.+)$') {
+                try {
+                    $reportTime = [datetime]::Parse($matches[1])
+                } catch {
+                    $reportTime = $null
+                }
+                break
+            }
+        }
 
-        $score = Get-SeverityScore -Text $line
+        # Fallback to file LastWriteTime if header timestamp is not available
+        if (-not $reportTime) {
+            try {
+                $reportTime = (Get-Item -LiteralPath $file).LastWriteTime
+            } catch {
+                $reportTime = $null
+            }
+        }
 
-        $rows.Add([pscustomobject]@{
-            Line          = $ln
-            Timestamp     = $ts
-            HResult       = $hr
-            ErrorCode     = $ecode
-            Exception     = $ex
-            Message       = $line
-            Severity      = Get-SeverityLabel -Score $score
-            SeverityScore = $score
-        }) | Out-Null
+        # --- Parse file content ---
+        $ln = 0
+        Get-Content -LiteralPath $file -ErrorAction Continue | ForEach-Object {
+            $ln += 1
+            $line = $_
+
+            if ($null -eq $line -or $line.Trim().Length -eq 0) {
+                return
+            }
+
+            # Extract fields (existing logic)
+            $hr = $null
+            $ecode = $null
+            $ex = $null
+
+            if ($line -match '(0x[0-9a-fA-F]{8})') { $hr = $matches[1] }
+            if ($line -match 'ErrorCode=(\d+)') { $ecode = $matches[1] }
+            if ($line -match '(?i)exception:? ([^;]+)') { $ex = $matches[1].Trim() }
+
+            $score = Get-SeverityScore -Text $line
+
+            $rows.Add([pscustomobject]@{
+                Line          = $ln
+                Timestamp     = $reportTime
+                HResult       = $hr
+                ErrorCode     = $ecode
+                Exception     = $ex
+                Message       = $line
+                Severity      = Get-SeverityLabel -Score $score
+                SeverityScore = $score
+                SourceFile    = $file
+                SourceFolder  = Split-Path -Path $file -Parent
+            }) | Out-Null
+        }
     }
 
     return $rows
 }
+
 # ---------- end: VMM report.txt collector ----------
 
 # Build HTML fragment with severity styling
@@ -704,10 +733,269 @@ function To-HtmlSection-VmmReport {
     return $sb.ToString()
 }
 
+
+# =================== NEW: report.txt discovery across SCVMM.* folders ===================
+
+function Get-RecentVmmReportFiles {
+    [CmdletBinding()]
+    param(
+        [string]$Root = 'C:\ProgramData\VMMLogs',
+        [string]$ChildPattern = 'SCVMM.*',
+        [string]$ReportName = 'report.txt',
+        [int]$ModifiedWithinDays = 7,
+
+        # Fallback option:
+        # Used only when there are NO report.txt files modified within the last N days.
+        # If set to 10, return the most recent 10 report.txt files by LastWriteTime.
+        # If set to 0 (or negative), return ALL report.txt files sorted by LastWriteTime desc.
+        [int]$FallbackTop = 10
+    )
+
+    # Calculate the cutoff timestamp (e.g., "now - 7 days")
+    $cutoff = (Get-Date).AddDays(-[math]::Abs($ModifiedWithinDays))
+
+    # If the root path doesn't exist, return an empty list
+    if (-not (Test-Path $Root)) { return @() }
+
+    # 1) Enumerate SCVMM.* folders and collect report.txt files under each folder
+    $allReports = @()
+    $folders = Get-ChildItem -Path $Root -Directory -Filter $ChildPattern -ErrorAction SilentlyContinue
+
+    foreach ($f in $folders) {
+        $p = Join-Path $f.FullName $ReportName
+        if (Test-Path $p) {
+            $allReports += Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
+        }
+    }
+
+    # If no report.txt files were found at all, return an empty list
+    if (-not $allReports -or $allReports.Count -eq 0) {
+        return @()
+    }
+
+    # 2) Primary filter:
+    # Return only report.txt files whose LastWriteTime is within the last N days.
+    $recent = $allReports | Where-Object { $_.LastWriteTime -ge $cutoff }
+
+    if ($recent -and $recent.Count -gt 0) {
+        return $recent
+    }
+
+    # 3) Fallback behavior:
+    # If there are NO report.txt files modified within the last N days,
+    # then return the most recent report.txt files by LastWriteTime.
+    $sorted = $allReports | Sort-Object LastWriteTime -Descending
+
+    if ($FallbackTop -le 0) {
+        # If FallbackTop is 0 or negative, return ALL files (sorted)
+        return $sorted
+    } else {
+        # Otherwise return Top N most recent files
+        return ($sorted | Select-Object -First $FallbackTop)
+    }
+}
+
+
+# NEW: HTML rendering with Source columns shown and per-folder badges
+function To-HtmlSection-VmmReport {
+    param($Rows)
+
+    if ($null -eq $Rows -or $Rows.Count -eq 0) {
+        return "<h2>VMM Error Log (report.txt, merged)</h2><div class='small'>No data</div>"
+    }
+
+    # Overall counts
+    $countCritical = ($Rows | Where-Object { $_.Severity -eq 'Critical' }).Count
+    $countHigh     = ($Rows | Where-Object { $_.Severity -eq 'High'     }).Count
+    $countMedium   = ($Rows | Where-Object { $_.Severity -eq 'Medium'   }).Count
+    $countLow      = ($Rows | Where-Object { $_.Severity -eq 'Low'      }).Count
+
+    $summary = "<div class='small'>
+    <span class='badge badge-critical'>Critical: $countCritical</span>
+    <span class='badge badge-high'>High: $countHigh</span>
+    <span class='badge badge-medium'>Medium: $countMedium</span>
+    <span class='badge badge-low'>Low: $countLow</span>
+</div>"
+
+    # Per-source mini-summary
+    $perFolder = ($Rows | Group-Object SourceFolder | ForEach-Object {
+        $f = $_.Name
+        $c4 = ($_.Group | Where-Object Severity -eq 'Critical').Count
+        $c3 = ($_.Group | Where-Object Severity -eq 'High').Count
+        $c2 = ($_.Group | Where-Object Severity -eq 'Medium').Count
+        $c1 = ($_.Group | Where-Object Severity -eq 'Low').Count
+        "<div class='small'><span class='badge'>$f</span> <span class='badge badge-critical'>$c4</span> <span class='badge badge-high'>$c3</span> <span class='badge badge-medium'>$c2</span> <span class='badge badge-low'>$c1</span></div>"
+    }) -join "`n"
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<h2>VMM Error Log (report.txt, merged)</h2>$summary$perFolder<div class='tablebox'><table><thead><tr>
+<th>#</th><th>Time</th><th>Severity</th><th>HResult</th><th>ErrorCode</th><th>Exception</th><th>Message</th><th>SourceFolder</th>
+</tr></thead><tbody>")
+
+    foreach ($r in $Rows) {
+        $cls   = "sev-$($r.Severity)"
+        $msg   = [System.Web.HttpUtility]::HtmlEncode([string]$r.Message)
+        $exEsc = [System.Web.HttpUtility]::HtmlEncode([string]$r.Exception)
+        $hrEsc = [System.Web.HttpUtility]::HtmlEncode([string]$r.Hikari)
+        $hrEsc = [System.Web.HttpUtility]::HtmlEncode([string]$r.HResult) # fix
+        $ecEsc = [System.Web.HttpUtility]::HtmlEncode([string]$r.ErrorCode)
+        $tEsc  = [System.Web.HttpUtility]::HtmlEncode([string]$r.Timestamp)
+        $src   = [System.Web.HttpUtility]::HtmlEncode([string]$r.SourceFolder)
+
+        [void]$sb.Append("<tr class='$cls'>
+<td>$($r.Line)</td>
+<td>$tEsc</td>
+<td>$($r.Severity)</td>
+<td>$hrEsc</td>
+<td>$ecEsc</td>
+<td>$exEsc</td>
+<td class='code'>$msg</td>
+<td>$src</td>
+</tr>")
+    }
+    [void]$sb.Append("</tbody></table></div>")
+    return $sb.ToString()
+}
+
+function New-VmmReportSummaryBadge {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$ReportRows
+    )
+
+    if (-not $ReportRows -or $ReportRows.Count -eq 0) {
+        return "<div class='small'>No report.txt data</div>"
+    }
+
+    # Use the earliest Report Created Time as representative
+    $times = $ReportRows |
+        Where-Object { $_.Timestamp } |
+        Select-Object -ExpandProperty Timestamp
+
+    $minTime = ($times | Sort-Object | Select-Object -First 1)
+
+    $sourceCount = ($ReportRows |
+        Select-Object -ExpandProperty SourceFolder -Unique).Count
+
+    return @"
+<div class='tablebox'>
+  <span class='badge badge-high'>Report Created Time</span>
+  <span class='badge'>$($minTime.ToString('yyyy-MM-dd HH:mm:ss'))</span>
+  <span class='badge badge-low'>Sources: $sourceCount report.txt files</span>
+</div>
+"@
+}
+
+function To-HtmlSection-VmmReport-Grouped {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Rows
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        return "<h2>VMM Error Log (report.txt)</h2><div class='small'>No data</div>"
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<h2>VMM Error Log (report.txt)</h2>")
+
+    # Group by SourceFolder + Timestamp
+    $groups = $Rows | Group-Object {
+        "{0}|{1}" -f $_.SourceFolder, $_.Timestamp
+    }
+
+    foreach ($g in $groups) {
+
+        $sample = $g.Group | Select-Object -First 1
+        $folder = $sample.SourceFolder
+        $time   = if ($sample.Timestamp) {
+            $sample.Timestamp.ToString('yyyy-MM-dd HH:mm:ss')
+        } else {
+            'Unknown'
+        }
+	$sevOrder = @{
+	    'Critical' = 1
+	    'High'     = 2
+	    'Medium'   = 3
+	    'Low'      = 4
+	    'None'     = 5
+	}
+	
+	# Severity summary per group
+	$sevSummary = (
+	    $g.Group |
+	        Group-Object Severity |
+	        Sort-Object { $sevOrder[$_.Name] } |
+	        ForEach-Object { "$($_.Name): $($_.Count)" }
+	) -join ', '
+       
+        [void]$sb.Append(@"
+<h3>Source: $folder</h3>
+<div class='small'>
+  <span class='badge'>$time</span>
+  <span class='badge badge-medium'>$sevSummary</span>
+</div>
+<div class='tablebox'>
+<table>
+<thead>
+<tr>
+  <th>#</th>
+  <th>Time</th>
+  <th>Severity</th>
+  <th>HResult</th>
+  <th>ErrorCode</th>
+  <th>Exception</th>
+  <th>Message</th>
+</tr>
+</thead>
+<tbody>
+"@)
+
+        foreach ($r in $g.Group) {
+            $cls = "sev-$($r.Severity)"
+
+            $msg = [System.Web.HttpUtility]::HtmlEncode($r.Message)
+            $ex  = [System.Web.HttpUtility]::HtmlEncode($r.Exception)
+            $hr  = [System.Web.HttpUtility]::HtmlEncode($r.HResult)
+            $ec  = [System.Web.HttpUtility]::HtmlEncode($r.ErrorCode)
+            $ts  = if ($r.Timestamp) {
+                $r.Timestamp.ToString('yyyy-MM-dd HH:mm:ss')
+            } else { '' }
+
+            [void]$sb.Append(@"
+<tr class='$cls'>
+  <td>$($r.Line)</td>
+  <td>$ts</td>
+  <td>$($r.Severity)</td>
+  <td>$hr</td>
+  <td>$ec</td>
+  <td>$ex</td>
+  <td class='code'>$msg</td>
+</tr>
+"@)
+        }
+
+        [void]$sb.Append("</tbody></table></div>")
+    }
+
+    return $sb.ToString()
+}
+
 # ------------------- Save CSVs -------------------
 
 # Collect VMM report.txt rows
-$reportRows = Parse-VmmReportTxt -Path 'C:\ProgramData\VMMLogs\report.txt'
+# Recent 7 days SCVMM.*\report.txt
+$reportFiles = Get-RecentVmmReportFiles -Root 'C:\ProgramData\VMMLogs' -ChildPattern 'SCVMM.*' -ReportName 'report.txt' -ModifiedWithinDays 7
+
+# Parsing the files (SourceFolder/SourceFile included)
+$reportRows  = Parse-VmmReportTxt -Path ($reportFiles.FullName)
+
+# CSV save for the files
+To-Csv $reportRows (Join-Path $OUT 'report_log.csv')
+
+# Update HTML section
+#$sections += To-HtmlSection-VmmReport -Rows $reportRows
+$sections += To-HtmlSection-VmmReport-Grouped -Rows $reportRows
 
 # Save CSV
 To-Csv $serverInfo  (Join-Path $OUT 'server_info.csv')
@@ -739,7 +1027,11 @@ $sections += To-HtmlSection -Title 'Logical Switch'                             
 $sections += To-HtmlSection -Title 'Host NIC-Virtual Switch-Logical Network mapping' -Data $nicMapRows
 $sections += To-HtmlSection -Title ('Recent jobs (past {0} hour)' -f $JobHistoryHours) -Data $jobRows
 $sections += To-HtmlSection -Title 'Host Network Connection Test (Port/WS-Man/WMI)'    -Data $netTestRows
+# --- Report.txt summary badge (TOP of HTML) ---
+$sections += New-VmmReportSummaryBadge -ReportRows $reportRows
+
 $sections += To-HtmlSection-VmmReport -Rows $reportRows
+
 
 $html = ConvertTo-Html -Head (Html-Style) -Body ($sections -join "`n")
 $null = $html | Set-Content -Path $HTMLpath -Encoding UTF8
